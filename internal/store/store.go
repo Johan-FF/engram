@@ -3369,6 +3369,65 @@ func (s *Store) ExportProject(project string) (*ExportData, error) {
 	return s.exportWithProjectScope(normalizedProject)
 }
 
+// ExportRelationMutations returns relation upsert mutations for non-orphaned
+// relation rows whose source and target observations are available locally.
+func (s *Store) ExportRelationMutations(project string) ([]SyncMutation, error) {
+	normalizedProject, _ := NormalizeProject(project)
+	normalizedProject = strings.TrimSpace(normalizedProject)
+
+	query := `
+		SELECT r.sync_id, r.source_id, r.target_id, r.relation, r.reason, r.evidence, r.confidence,
+		       r.judgment_status, r.marked_by_actor, r.marked_by_kind, r.marked_by_model,
+		       r.session_id, coalesce(nullif(src.project, ''), src_s.project, ''), r.created_at, r.updated_at
+		FROM memory_relations r
+		JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+		JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+		LEFT JOIN sessions src_s ON src_s.id = src.session_id
+		LEFT JOIN sessions tgt_s ON tgt_s.id = tgt.session_id
+		WHERE r.judgment_status != ?`
+	args := []any{JudgmentStatusOrphaned}
+	if normalizedProject != "" {
+		query += ` AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
+			AND coalesce(nullif(tgt.project, ''), tgt_s.project, '') = ?`
+		args = append(args, normalizedProject, normalizedProject)
+	}
+	query += ` ORDER BY r.created_at, r.sync_id`
+
+	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("export relation mutations: %w", err)
+	}
+	defer rows.Close()
+
+	mutations := []SyncMutation{}
+	for rows.Next() {
+		var p syncRelationPayload
+		if err := rows.Scan(
+			&p.SyncID, &p.SourceID, &p.TargetID, &p.Relation, &p.Reason, &p.Evidence, &p.Confidence,
+			&p.JudgmentStatus, &p.MarkedByActor, &p.MarkedByKind, &p.MarkedByModel,
+			&p.SessionID, &p.Project, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("export relation mutations: scan: %w", err)
+		}
+		payload, err := json.Marshal(p)
+		if err != nil {
+			return nil, fmt.Errorf("export relation mutations: marshal %s: %w", p.SyncID, err)
+		}
+		mutations = append(mutations, SyncMutation{
+			Entity:     SyncEntityRelation,
+			EntityKey:  strings.TrimSpace(p.SyncID),
+			Op:         SyncOpUpsert,
+			Payload:    string(payload),
+			Project:    strings.TrimSpace(p.Project),
+			OccurredAt: p.UpdatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("export relation mutations: rows: %w", err)
+	}
+	return mutations, nil
+}
+
 func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 	data := &ExportData{
 		Version:    "0.1.0",
